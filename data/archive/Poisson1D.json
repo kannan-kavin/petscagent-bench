@@ -1,0 +1,15 @@
+{
+  "problem_name": "Poisson1D_FD_KSP",
+  "problem_id": "7",
+  "problem_description": "Write a single, compilable C program that solves the 1D Poisson equation on the unit interval with homogeneous Dirichlet boundary conditions using a strict second-order central Finite-Difference discretization and PETSc's KSP linear solver.\n\nEquations:\nSolve the boundary value problem:\n$-\\frac{d^2 u}{dx^2}(x) = f(x), \\quad x \\in (0,1), \\quad u(0) = u(1) = 0$\nwith forcing $f(x) = \\pi^2 \\sin(\\pi x)$, whose exact solution is $u_{exact}(x) = \\sin(\\pi x)$.\n\nSetup:\n- Domain: (0,1), uniform 1D grid with N interior unknowns and spacing h = 1/(N+1).\n- Grid Arrangement: Node-centered. Unknowns $u_i$ at interior nodes $x_i = i \\cdot h$ for $i = 1,\\dots,N$; boundary nodes $x_0$ and $x_{N+1}$ are eliminated by the Dirichlet conditions.\n- Discretization: Standard 3-point central stencil for $-u''$, with diagonal $2/h^2$ and off-diagonals $-1/h^2$.\n- Problem size N is an input argument (-N <int>) with default 1000. The program will be tested across multiple values of N, and the solution error must exhibit the expected O(h^2) convergence of the discretization.\n\nRequirements:\n1. Discretization: Use a strict 3-point finite-difference stencil on the interior nodes.\n   - Assemble the stiffness matrix A as a sparse PETSc Mat (MATAIJ) with appropriate preallocation for a tridiagonal sparsity pattern.\n   - Assemble the right-hand side vector b by evaluating f at each interior node.\n2. Storage: Use a single PETSc Vec for the unknowns u and a single PETSc Vec for the right-hand side b.\n3. Solver: Use PETSc's KSP with KSPCG and PCJACOBI as defaults, but call KSPSetFromOptions so the user can override at runtime. Set the relative tolerance to 1e-10.\n4. Implementation: Self-contained C file, no external dependencies. Run on 1 MPI process.\n\nOutput:\nAt the end of the output, print a single line containing only a scalar measure of accuracy--the discrete L2-norm of the error $\\sqrt{h \\sum_i (u_i - u_{exact}(x_i))^2}$. The line must contain only the numeric value (no words, labels, or extra characters).",
+  "test_cases": [
+    {
+      "args": "-N 100",
+      "expected_output": [5.701403310754e-05]
+    },
+    {
+      "args": "-N 1000",
+      "expected_output": [5.804109113183e-07]
+    }
+  ]
+}

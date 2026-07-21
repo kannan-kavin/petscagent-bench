@@ -89,8 +89,84 @@ class NumericalAccuracyMetric(Evaluator):
                 evaluation_method=self.evaluation_method,
                 execution_time_ms=(time.time() - start_time) * 1000
             )
-        
-        # Extract solution from output
+
+        # Multi-case path: if the runner produced one stdout per test_case,
+        # score each case against its own expected_output and report the worst.
+        per_case = execution_result.get('per_case_results')
+        if per_case:
+            tolerance = self.config.get('error_tolerance', 1e-6) if self.config else 1e-6
+            threshold = self.config.get('error_threshold', 1e-6) if self.config else 1e-6
+            case_reports = []
+            try:
+                for case in per_case:
+                    exp = case.get('expected_output')
+                    if exp is None:
+                        continue
+                    case_stdout = case.get('stdout', '') or ''
+                    case_stdout = '\n'.join(
+                        line for line in case_stdout.splitlines() if re.match(r'^-?\d', line)
+                    )
+                    if not case.get('runs', False) or not case_stdout:
+                        case_reports.append({
+                            'args': case.get('args', ''), 'error': float('inf'), 'passed': False,
+                        })
+                        continue
+                    err = self._compute_error_norm(case_stdout, exp)
+                    case_reports.append({
+                        'args': case.get('args', ''), 'error': float(err),
+                        'passed': bool(err < threshold),
+                    })
+            except Exception as e:
+                return EvaluationResult(
+                    evaluator_name=self.name,
+                    evaluator_type=self.evaluator_type,
+                    passed=False,
+                    raw_value=None,
+                    normalized_score=0.0,
+                    confidence=0.5,
+                    feedback=f"Error computing per-case accuracy: {str(e)}",
+                    metadata={'error': str(e), 'error_type': type(e).__name__},
+                    evaluation_method=self.evaluation_method,
+                    execution_time_ms=(time.time() - start_time) * 1000,
+                )
+
+            if not case_reports:
+                # Fall through to single-case logic below if no usable cases.
+                pass
+            else:
+                worst = max(case_reports, key=lambda c: c['error'])
+                all_passed = all(c['passed'] for c in case_reports)
+                normalized_score = min(1.0, float(np.exp(-worst['error'] / tolerance))) if np.isfinite(worst['error']) else 0.0
+                summary = ", ".join(
+                    f"[{c['args'] or 'default'}] err={c['error']:.2e}{' OK' if c['passed'] else ' FAIL'}"
+                    for c in case_reports
+                )
+                feedback = (
+                    f"All {len(case_reports)} cases passed (worst error {worst['error']:.2e}). {summary}"
+                    if all_passed else
+                    f"{sum(1 for c in case_reports if not c['passed'])}/{len(case_reports)} cases failed "
+                    f"(worst error {worst['error']:.2e}, threshold {threshold:.2e}). {summary}"
+                )
+                return EvaluationResult(
+                    evaluator_name=self.name,
+                    evaluator_type=self.evaluator_type,
+                    passed=bool(all_passed),
+                    raw_value=float(worst['error']) if np.isfinite(worst['error']) else None,
+                    normalized_score=float(normalized_score),
+                    confidence=1.0,
+                    feedback=feedback,
+                    metadata={
+                        'per_case': case_reports,
+                        'worst_error': float(worst['error']) if np.isfinite(worst['error']) else None,
+                        'threshold': threshold,
+                        'tolerance': tolerance,
+                        'multi_case': True,
+                    },
+                    evaluation_method=self.evaluation_method,
+                    execution_time_ms=(time.time() - start_time) * 1000,
+                )
+
+        # Single-case path (original behavior).
         stdout = execution_result['stdout']
         stdout = '\n'.join([line for line in stdout.splitlines() if re.match(r'^-?\d', line)]) # keep numbers only
         expected_output = test_case['expected_output']

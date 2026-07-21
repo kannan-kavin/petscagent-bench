@@ -69,6 +69,8 @@ def read_from_json(path):
     for file in Path(path).iterdir():
         if not os.path.isfile(file):
             continue
+        if file.suffix.lower() != ".json":
+            continue
         with open(file, "r", encoding="utf-8") as fd:
             data.append(json.loads(fd.read().strip()))
     return data
@@ -116,6 +118,9 @@ class BenchmarkResult:
     category_scores: Optional[Dict[str, float]] = None
     evaluation_summary: Optional[Dict[str, Any]] = None
     evaluation_details: Optional[List[Dict[str, Any]]] = None
+    per_case_results: Optional[List[Dict[str, Any]]] = None
+    attempts: Optional[int] = None  # 1 = first try; 2 = recovered after 1 retry; etc.
+    attempt_history: Optional[List[Dict[str, Any]]] = None
 
 
 class Agent:
@@ -314,67 +319,161 @@ class Agent:
             generated_codes = []
 
             try:
-                # Try to load from cache first
-                purple_agent_response = None
-                if self.use_cache:
-                    purple_agent_response = self._load_cached_response(pname)
-                # If no cache, call the purple agent
-                if purple_agent_response is None:
+                max_retries = int(os.environ.get("PETSCAGENT_RETRIES", "0"))
+                attempt_history: List[Dict[str, Any]] = []
+                prompt_for_attempt = pdesc
+                attempt_idx = 0
+                while True:
+                    attempt_idx += 1
+                    # Reset per-attempt state on the BenchmarkResult so a failed
+                    # earlier attempt doesn't leak into the next attempt.
+                    if attempt_idx > 1:
+                        br.compile_stdout = None
+                        br.compile_stderr = None
+                        br.compiles = False
+                        br.stdout = None
+                        br.stderr = None
+                        br.runs = False
+                        br.execution_time_sec = None
+                        br.per_case_results = None
+                        generated_codes = []
+
+                    # Try to load from cache first (only on attempt 1)
+                    purple_agent_response = None
+                    if self.use_cache and attempt_idx == 1:
+                        purple_agent_response = self._load_cached_response(pname)
+                    # If no cache, call the purple agent
+                    if purple_agent_response is None:
+                        print(
+                            f"@@@ Green agent: Sending message to purple agent (attempt {attempt_idx})... -->\n{prompt_for_attempt[:500]}"
+                        )
+                        timestamp_started = time.time()
+                        purple_agent_response = await send_message(
+                            self.purple_agent_url,
+                            prompt_for_attempt,
+                            context_id=pname,
+                        )
+                        br.time_used_sec = (br.time_used_sec or 0.0) + (time.time() - timestamp_started)
+                    else:
+                        print(f"@@@ Green agent: Using cached response for {pname}")
+
+                    # Cache the response (only attempt 1)
+                    if self.use_cache and attempt_idx == 1:
+                        self._save_cached_response(pname, purple_agent_response)
+
+                    res_root = purple_agent_response.root
+                    if not isinstance(res_root, SendMessageSuccessResponse):
+                        raise ValueError(f"Expected SendMessageSuccessResponse, got {type(res_root).__name__}")
+                    res_result = res_root.result
+                    if not isinstance(res_result, Message):
+                        raise ValueError(f"Expected Message, got {type(res_result).__name__}")
+                    text_list = get_text_parts(res_result.parts)
+                    file_list = get_file_parts(res_result.parts)
+                    if len(text_list) != 1:
+                        raise ValueError(f"Expected exactly one text part from purple agent, got {len(text_list)}")
+                    # Parse response to find code
+                    _PATTERN = re.compile(
+                        r"^Code generation successful[^\n]*\n"
+                        r"nsize:\s*(?P<nsize>[^\n]+)\n"
+                        r"cli_args:\s*(?P<cli_args>[^\n]*)\n",
+                        re.DOTALL,
+                    )
+                    m = _PATTERN.search(text_list[0])
+                    if not m:
+                        raise ValueError(
+                            "Could not parse purple agent response. Probably failed to generate the code."
+                        )
+                    # nsize = m.group("nsize")
+                    cli_args = m.group("cli_args")
+                    br.cli_args = cli_args
                     print(
-                        f"@@@ Green agent: Sending message to purple agent... -->\n{pdesc}"
+                        f"@@@ Green agent: Compile and run the code generated by purple agent..."
                     )
-                    timestamp_started = time.time()
-                    purple_agent_response = await send_message(
-                        self.purple_agent_url,
-                        pdesc,
-                        context_id=pname,
-                    )
-                    br.time_used_sec = time.time() - timestamp_started
-                else:
-                    print(f"@@@ Green agent: Using cached response for {pname}")
+                    if not mcp_initialized:
+                        await self.mcp_client.initialize()
+                        mcp_initialized = True
+                    # Upload files to server
+                    dep_list = await self._create_files_on_server(pname, file_list, generated_codes)
+                    # Compile the code (do not let a compile failure abort the retry loop)
+                    try:
+                        await self._compile_code(br, pname, dep_list)
+                    except petscmcp.MCPDynamicClientReturnCode:
+                        pass  # compile_stderr / br.compiles already set by _compile_code
+                    # Run the executable (only if compilation succeeded).
+                    if br.compiles:
+                        test_cases = data.get("test_cases") or []
+                        if len(test_cases) > 1:
+                            per_case: List[Dict[str, Any]] = []
+                            for ci, tc in enumerate(test_cases):
+                                case_args = tc.get("args", "") or ""
+                                case_br = BenchmarkResult(
+                                    problem_name=pname,
+                                    problem_id=pid,
+                                    runs=False,
+                                    time_used_sec=0.0,
+                                    compiles=True,
+                                )
+                                try:
+                                    await self._run_executable(case_br, pname, case_args)
+                                except Exception:
+                                    pass
+                                per_case.append({
+                                    "args": case_args,
+                                    "stdout": case_br.stdout or "",
+                                    "stderr": case_br.stderr or "",
+                                    "runs": bool(case_br.runs),
+                                    "execution_time_sec": case_br.execution_time_sec,
+                                    "expected_output": tc.get("expected_output"),
+                                })
+                                if ci == 0:
+                                    br.stdout = case_br.stdout
+                                    br.stderr = case_br.stderr
+                                    br.runs = case_br.runs
+                                    br.execution_time_sec = case_br.execution_time_sec
+                                    br.cli_args = case_args
+                            br.per_case_results = per_case
+                        else:
+                            try:
+                                await self._run_executable(br, pname, cli_args)
+                            except petscmcp.MCPDynamicClientReturnCode:
+                                pass  # stderr/runs already populated
 
-                # Cache the response
-                if self.use_cache:
-                    self._save_cached_response(pname, purple_agent_response)
+                    attempt_history.append({
+                        "attempt": attempt_idx,
+                        "compiles": bool(br.compiles),
+                        "runs": bool(br.runs),
+                        "compile_stderr_excerpt": (br.compile_stderr or "")[:1500],
+                        "stderr_excerpt": (br.stderr or "")[:1500],
+                    })
 
-                res_root = purple_agent_response.root
-                if not isinstance(res_root, SendMessageSuccessResponse):
-                    raise ValueError(f"Expected SendMessageSuccessResponse, got {type(res_root).__name__}")
-                res_result = res_root.result
-                if not isinstance(res_result, Message):
-                    raise ValueError(f"Expected Message, got {type(res_result).__name__}")
-                text_list = get_text_parts(res_result.parts)
-                file_list = get_file_parts(res_result.parts)
-                if len(text_list) != 1:
-                    raise ValueError(f"Expected exactly one text part from purple agent, got {len(text_list)}")
-                # Parse response to find code
-                _PATTERN = re.compile(
-                    r"^Code generation successful[^\n]*\n"
-                    r"nsize:\s*(?P<nsize>[^\n]+)\n"
-                    r"cli_args:\s*(?P<cli_args>[^\n]+)\n",
-                    re.DOTALL,
-                )
-                m = _PATTERN.search(text_list[0])
-                if not m:
-                    raise ValueError(
-                        "Could not parse purple agent response. Probably failed to generate the code."
+                    # Success criteria: compiled AND ran. Bail out of retry loop.
+                    if br.compiles and br.runs:
+                        break
+                    # No more retries left?
+                    if attempt_idx > max_retries:
+                        break
+                    # Build feedback prompt for the next attempt.
+                    if not br.compiles:
+                        err_block = (br.compile_stderr or "(no stderr captured)")[-3000:]
+                        fail_kind = "compilation"
+                    else:
+                        err_block = (br.stderr or "(no stderr captured)")[-3000:]
+                        fail_kind = "runtime"
+                    prompt_for_attempt = (
+                        f"{pdesc}\n\n"
+                        f"==========================================================\n"
+                        f"YOUR PREVIOUS ATTEMPT FAILED at the {fail_kind} stage.\n"
+                        f"Diagnose the root cause from the error output below and return a CORRECTED, complete, self-contained C source file.\n"
+                        f"Use the same response format as before (Code generation successful / nsize / cli_args / file part with the C source).\n"
+                        f"Do NOT just retry the same code. Identify the specific problem (hallucinated API, missing #include, wrong type, "
+                        f"out-of-order setup call, etc.) and fix it.\n\n"
+                        f"--- {fail_kind} error output (truncated to last 3000 chars) ---\n"
+                        f"{err_block}\n"
+                        f"--- end error output ---\n"
                     )
-                # nsize = m.group("nsize")
-                cli_args = m.group("cli_args")
-                br.cli_args = cli_args
-                print(
-                    f"@@@ Green agent: Compile and run the code generated by purple agent..."
-                )
-                if not mcp_initialized:
-                    await self.mcp_client.initialize()
-                    mcp_initialized = True
-                # Upload files to server
-                dep_list = await self._create_files_on_server(pname, file_list, generated_codes)
-                # Compile the code
-                await self._compile_code(br, pname, dep_list)
-                # Run the executable (only if compilation succeeded)
-                if br.compiles:
-                    await self._run_executable(br, pname, cli_args)
+
+                br.attempts = attempt_idx
+                br.attempt_history = attempt_history
 
                 # Run evaluation system
                 print(f"@@@ Green agent: Evaluating generated code...")
@@ -471,6 +570,7 @@ class Agent:
                 'stderr': benchmark_result.stderr or '',
                 'execution_time_sec': benchmark_result.execution_time_sec or benchmark_result.time_used_sec,
                 'memory_mb': None,  # TODO: Add memory tracking if available
+                'per_case_results': benchmark_result.per_case_results,
             }
             # Run evaluation pipeline
             eval_results = await self.evaluation_pipeline.evaluate(

@@ -16,6 +16,10 @@ import json
 import mcp
 from src.green_agent.server import start_green_agent, load_green_agent_config
 from src.purple_agent.petsc_agent import start_purple_agent, load_purple_agent_config
+from src.purple_agent_v2.petsc_agent import (
+    start_purple_agent_v2,
+    load_purple_agent_v2_config,
+)
 from src.util.a2a_comm import wait_agent_ready, send_message
 import os
 import dotenv
@@ -38,10 +42,10 @@ def run_green_agent(agent_llm, api_base_url=None):
 
 def run_purple_agent(agent_llm, api_base_url=None):
     """Execute the Purple Agent in a separate process.
-    
+
     Starts the Purple Agent with a specific LLM configuration.
     The LLM model can be changed here to test different models.
-    
+
     Currently configured to use: openai/gpt-5.2
     Other options: gemini/gemini-2.5-flash, openai/gpt-4o, etc.
     """
@@ -49,7 +53,16 @@ def run_purple_agent(agent_llm, api_base_url=None):
     # asyncio.run(start_purple_agent(agent_llm="openai/google-claude-45-opus")) # test AskSage
 
 
-async def launch_evaluation():
+def run_purple_agent_v2(agent_llm, api_base_url=None, mcp_server_url=None):
+    """Execute the self-verifying Purple Agent v2 in a separate process."""
+    asyncio.run(start_purple_agent_v2(
+        agent_llm=agent_llm,
+        api_base_url=api_base_url,
+        mcp_server_url=mcp_server_url,
+    ))
+
+
+async def launch_evaluation(purple_variant: str = "v1"):
     """Main launcher function - initiates and coordinates the evaluation process.
     
     This function orchestrates the complete benchmark workflow:
@@ -91,10 +104,14 @@ async def launch_evaluation():
     green_model = green_llm_cfg.get('model', 'openai/gpt-4o-mini')
     green_api_base_url = green_llm_cfg.get('api_base_url')
 
-    purple_cfg = load_purple_agent_config()
-    purple_llm_cfg = purple_cfg.get('llm')
+    if purple_variant == "v2":
+        purple_cfg = load_purple_agent_v2_config()
+    else:
+        purple_cfg = load_purple_agent_config()
+    purple_llm_cfg = purple_cfg.get('llm') or {}
     purple_model = purple_llm_cfg.get('model', 'openai/gpt-4o-mini')
     purple_api_base_url = purple_llm_cfg.get('api_base_url')
+    purple_mcp_server_url = (purple_cfg.get('mcp') or {}).get('server_url') if purple_variant == "v2" else None
     # Step 1: Start Green Agent (assessment manager)
     print("Launching green agent...")
     p_green = multiprocessing.Process(target=run_green_agent, args=(green_model, green_api_base_url))
@@ -103,8 +120,18 @@ async def launch_evaluation():
     print("Green agent is ready.")
 
     # Step 2: Start Purple Agent (code generator being tested)
-    print("Launching purple agent...")
-    p_purple = multiprocessing.Process(target=run_purple_agent, args=(purple_model, purple_api_base_url))
+    if purple_variant == "v2":
+        print("Launching purple agent v2 (self-verifying)...")
+        p_purple = multiprocessing.Process(
+            target=run_purple_agent_v2,
+            args=(purple_model, purple_api_base_url, purple_mcp_server_url),
+        )
+    else:
+        print("Launching purple agent (baseline)...")
+        p_purple = multiprocessing.Process(
+            target=run_purple_agent,
+            args=(purple_model, purple_api_base_url),
+        )
     p_purple.start()
     assert await wait_agent_ready(purple_url), "purple agent not ready in time"
     print("purple agent is ready.")
@@ -113,7 +140,22 @@ async def launch_evaluation():
     print("Launching MCP server for green agent...")
     petsc_mcp_server = multiprocessing.Process(target=start_mcp_server)
     petsc_mcp_server.start()
-    print("PETSc MCP server is ready.")
+    # Poll until the MCP port accepts TCP connections — otherwise short bench
+    # runs (single-problem A/Bs) can finish before Purple's verify loop can
+    # reach MCP, silently degenerating to no-self-verify in every arm.
+    import socket as _socket
+    _mcp_host, _mcp_port = "localhost", 8080
+    for _i in range(60):
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
+            _s.settimeout(0.5)
+            try:
+                _s.connect((_mcp_host, _mcp_port))
+                print(f"PETSc MCP server is ready (port {_mcp_port} accepting connections).")
+                break
+            except OSError:
+                await asyncio.sleep(1)
+    else:
+        print(f"WARNING: MCP server did not become ready within 60s on port {_mcp_port}; continuing anyway.")
 
     # Step 4: Send evaluation task to Green Agent
     print("Sending task description to green agent...")

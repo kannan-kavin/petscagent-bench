@@ -15,6 +15,7 @@ import asyncio
 
 from src.green_agent.server import start_green_agent
 from src.purple_agent.petsc_agent import start_purple_agent
+from src.purple_agent_v2.petsc_agent import start_purple_agent_v2
 from src.launcher import launch_evaluation
 
 # Initialize Typer application with descriptive help text
@@ -53,24 +54,43 @@ def purple():
 
 
 @app.command()
-def launch():
+def purple_v2():
+    """Start the self-verifying Purple Agent v2.
+
+    Same A2A interface as `purple`, but compiles (and optionally smoke-runs)
+    its own output via the PETSc compile-run MCP server before responding.
+    Configured via `config/purple_agent_v2_config.yaml`.
+    """
+    start_purple_agent_v2()
+
+
+@app.command()
+def launch(
+    purple_variant: str = typer.Option(
+        "v1",
+        "--purple-variant",
+        help="Which Purple Agent to evaluate: 'v1' (baseline) or 'v2' (self-verifying).",
+    ),
+):
     """Launch the complete evaluation workflow.
-    
+
     This command orchestrates the full benchmark process:
     1. Starts the Green Agent (assessment manager)
-    2. Starts the Purple Agent (code generator)
+    2. Starts the chosen Purple Agent variant (code generator)
     3. Starts the MCP server (for compilation/execution tools)
     4. Initiates the evaluation process
     5. Collects results and generates reports
     6. Cleanly shuts down all components
-    
+
     Results are saved to the 'output/' directory.
-    
+
     Prerequisites:
     - PETSc must be installed and PETSC_DIR/PETSC_ARCH set in .env
     - API keys for LLM providers must be configured in .env
     """
-    asyncio.run(launch_evaluation())
+    if purple_variant not in ("v1", "v2"):
+        raise typer.BadParameter("--purple-variant must be 'v1' or 'v2'")
+    asyncio.run(launch_evaluation(purple_variant=purple_variant))
 
 
 if __name__ == "__main__":

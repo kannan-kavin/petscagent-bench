@@ -218,7 +218,12 @@ class PetscAgentExecutor(AgentExecutor):
                 if is_asksage_endpoint:
                     litellm.ssl_verify = os.environ["ASKSAGE_SSL_CERT_FILE"]
                     completion_kwargs['api_key'] = os.environ["ASKSAGE_API_KEY"]
-            response = completion(**completion_kwargs)
+            # Argo proxy (as of 2026-07-13) rejects non-streaming calls that
+            # may exceed 10 min. Force streaming and reassemble so downstream
+            # code (response.choices[0].message.content) is unchanged.
+            completion_kwargs['stream'] = True
+            chunks = list(completion(**completion_kwargs))
+            response = litellm.stream_chunk_builder(chunks, messages=messages)
             # Extract the generated content from LLM response
             content = response.choices[0].message.content
             if isinstance(content, str):

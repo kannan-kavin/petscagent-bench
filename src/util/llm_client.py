@@ -66,7 +66,14 @@ class LLMClient:
                 if is_asksage_endpoint:
                     litellm.ssl_verify = os.environ["ASKSAGE_SSL_CERT_FILE"]
                     completion_kwargs['api_key'] = os.environ["ASKSAGE_API_KEY"]
-            response = await acompletion(**completion_kwargs)
+            # Argo proxy (as of 2026-07-13) rejects non-streaming calls that
+            # may exceed 10 min; force streaming and reassemble.
+            completion_kwargs['stream'] = True
+            stream = await acompletion(**completion_kwargs)
+            chunks = []
+            async for chunk in stream:
+                chunks.append(chunk)
+            response = litellm.stream_chunk_builder(chunks, messages=messages)
             # Parse JSON response
             content = response.choices[0].message.content
             if isinstance(content, str):
@@ -114,10 +121,15 @@ class LLMClient:
 
         messages.append({"role": "user", "content": prompt})
 
-        response = await acompletion(
+        stream = await acompletion(
             model=self.model,
             messages=messages,
             temperature=self.temperature,
+            stream=True,
         )
+        chunks = []
+        async for chunk in stream:
+            chunks.append(chunk)
+        response = litellm.stream_chunk_builder(chunks, messages=messages)
 
         return response.choices[0].message.content

@@ -28,7 +28,6 @@ Also new:
 - `scripts/run_*_ab.sh` — one A/B harness per feature; each backs up the config, toggles the knob, runs both arms, and diffs
 - `scripts/agg_*.py` — pure-Python aggregators for multi-repeat A/B runs (noise estimation)
 - `snapshots/` — reference outputs from `claudeopus47`, `gemini25pro`, and `gpt52` on all 6 active problems
-- `CLAUDE.md` — engineering notes covering the v1/v2 split, config nuances, and A/B workflow in depth
 
 Core building blocks:
 
@@ -167,7 +166,6 @@ Codes are assigned to tiers based on composite scores:
 ├── snapshots/                      # Reference outputs from claudeopus47, gemini25pro, gpt52
 ├── main.py                         # CLI entry point (green/purple/purple-v2/launch)
 ├── pyproject.toml                  # Python project configuration
-├── CLAUDE.md                       # Detailed engineering notes (v1/v2 split, config, A/B)
 └── output/                         # Generated reports (gitignored; regenerated per run)
 ```
 
@@ -201,7 +199,7 @@ PETSC_DIR="<path_to_petsc_installation>"
 PETSC_ARCH="<petsc_architecture>"              # e.g., arch-darwin-c-debug
 ```
 
-The repo is configured against ANL's **Argo proxy** by default (`https://apps-dev.inside.anl.gov/argoapi/v1`) — VPN required. See `CLAUDE.md` for endpoint-specific setup notes.
+The repo is configured against ANL's **Argo proxy** by default (`https://apps-dev.inside.anl.gov/argoapi/v1`) — VPN required.
 
 ## Usage
 

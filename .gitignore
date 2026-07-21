@@ -13,6 +13,9 @@ __pycache__/
 *.pem
 *.key
 
+# Local AI assistant context (not for public consumption)
+CLAUDE.md
+
 # Benchmark outputs (regenerable, big, noisy)
 output/
 output_*/

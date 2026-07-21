@@ -8,6 +8,28 @@ This repository implements a multi-agent benchmark for evaluating code generatio
 > [!IMPORTANT]
 > 📖 See [MOTIVATION.md](MOTIVATION.md) for the motivation and design rationale behind this project.
 
+## What's in this fork
+
+This fork adds a **v2 Purple Agent** (`src/purple_agent_v2/`) that layers six independently-toggleable features on top of the baseline single-shot v1 agent. Each feature was designed to help the agent for *any* PETSc problem, not just the ones in the benchmark suite, and every feature ships with an A/B script under `scripts/` so the delta over baseline can be measured empirically.
+
+| # | Feature | Config knob | What it does |
+|---|---------|-------------|--------------|
+| 1 | Self-verify loop | `self_fix.max_iters` | Compile + smoke-run the generated code via MCP; feed stderr back to the LLM on failure |
+| 2 | Diagnostic-flag checks | `self_fix.check_diagnostics` | Inject `-ksp_converged_reason`, `-snes_converged_reason`, `-ts_monitor`; parse output for silent solver failures |
+| 3 | RAG over PETSc tutorials | `rag.enabled` | FAISS vector search + flashrank cross-encoder rerank over ~295 tutorials (`src/petsc_rag/`) |
+| 4 | Header lookup | `header_lookup.enabled` | Reactive PETSc signature injection on compile failure |
+| 5 | Plan-then-code | `plan.enabled` | Separate "numerical analyst" LLM turn emits a structured `NumericalPlan` before code generation |
+| 6 | Multi-plan + judge | `plan.num_plans > 1` | Generate N candidate plans from different angles (simplest / accurate / robust), judge LLM picks the winner |
+
+**Multi-plan + judge (feature 6)** is currently the strongest configuration in this fork, delivering a ~3.2-point composite score improvement over the v1 baseline on the 6-problem active suite. Toggle any feature off in `config/purple_agent_v2_config.yaml` to reproduce the A/B.
+
+Also new:
+- `src/petsc_rag/` — the FAISS + flashrank retrieval pipeline (build the index once with `python -m petsc_rag.build_index`)
+- `scripts/run_*_ab.sh` — one A/B harness per feature; each backs up the config, toggles the knob, runs both arms, and diffs
+- `scripts/agg_*.py` — pure-Python aggregators for multi-repeat A/B runs (noise estimation)
+- `snapshots/` — reference outputs from `claudeopus47`, `gemini25pro`, and `gpt52` on all 6 active problems
+- `CLAUDE.md` — engineering notes covering the v1/v2 split, config nuances, and A/B workflow in depth
+
 Core building blocks:
 
 - **A2A Protocol**: standardized agent-to-agent communication over HTTP.
@@ -126,21 +148,27 @@ Codes are assigned to tiers based on composite scores:
 
 ```
 ├── data/                           # Benchmark problems (JSON files)
-├── config/                         # Configuration files
+│   └── archive/                    # Historical problems (still readable, not in default suite)
+├── config/
 │   ├── green_agent_config.yaml     # Green agent evaluation + scoring + LLM settings
-│   └── purple_agent_config.yaml    # Purple agent LLM settings
+│   └── purple_agent_v2_config.yaml # v2 Purple: self-fix, RAG, header lookup, plan, multi-plan
 ├── src/
-│   ├── client_cli.py               # Sends “start benchmark” task to the Green Agent
 │   ├── launcher.py                 # Spawns Green/Purple/MCP locally (end-to-end)
 │   ├── green_agent/                # Assessment manager agent
-│   ├── purple_agent/               # Target agent under test
+│   ├── purple_agent/               # v1 target agent (single-shot baseline)
+│   ├── purple_agent_v2/            # v2 target agent (self-verify + RAG + plan + judge)
+│   ├── petsc_rag/                  # FAISS index + flashrank rerank over PETSc tutorials
 │   ├── evaluators/                 # Gates / metrics / quality evaluators
-│   ├── metrics/                    # Score aggregation + tiering
 │   └── util/                       # A2A helpers + LLM client
-├── main.py                         # CLI entry point (green/purple/launch)
+├── scripts/
+│   ├── run_*_ab.sh                 # One A/B harness per v2 feature
+│   ├── run_*_ab_repeat.sh          # N-repeat variants for noise estimation
+│   └── agg_*.py, diff_*.py         # Aggregators and per-problem diff tools
+├── snapshots/                      # Reference outputs from claudeopus47, gemini25pro, gpt52
+├── main.py                         # CLI entry point (green/purple/purple-v2/launch)
 ├── pyproject.toml                  # Python project configuration
-├── output/                         # Generated reports and results
-└── purple_agent_cache/             # Cached purple-agent responses (optional)
+├── CLAUDE.md                       # Detailed engineering notes (v1/v2 split, config, A/B)
+└── output/                         # Generated reports (gitignored; regenerated per run)
 ```
 
 ## Installation
@@ -162,59 +190,77 @@ uv sync
 2. Create a `.env` file in the root directory with the following variables:
 
 ```bash
-# LLM API Keys
-GEMINI_API_KEY="<your_gemini_key>"
-OPENAI_API_KEY="<your_openai_key>"
+# LLM API Keys (only those actually used by your configured models are required)
+OPENAI_API_KEY="<your_openai_key>"             # OpenAI or Argo/OpenAI-compatible proxy
+GEMINI_API_KEY="<your_gemini_key>"             # only if you use gemini25pro directly
+ASKSAGE_API_KEY="<your_asksage_key>"           # only if api_base_url starts with api.asksage.anl.gov
+ASKSAGE_SSL_CERT_FILE="<path/to/cert.pem>"     # AskSage requires a custom SSL cert
 
 # PETSc Configuration (required for compilation/execution)
 PETSC_DIR="<path_to_petsc_installation>"
-PETSC_ARCH="<petsc_architecture>"  # e.g., arch-darwin-c-debug
+PETSC_ARCH="<petsc_architecture>"              # e.g., arch-darwin-c-debug
 ```
+
+The repo is configured against ANL's **Argo proxy** by default (`https://apps-dev.inside.anl.gov/argoapi/v1`) — VPN required. See `CLAUDE.md` for endpoint-specific setup notes.
 
 ## Usage
 
 ### Quick Start
 
-For local testing, launch the complete evaluation workflow:
+For local testing, launch the complete evaluation workflow. Pick which Purple variant to grade:
 
 ```bash
-uv run main.py launch
+uv run main.py launch --purple-variant v2   # v2 agent (self-verify + RAG + plan + judge)
+uv run main.py launch --purple-variant v1   # v1 baseline agent (single-shot)
 ```
 
-This command will:
-1. Start the Green Agent (assessment manager)
-2. Start the Purple Agent (code generator)
-3. Start the MCP server (compilation/execution tools)
-4. Run all benchmark problems
-5. Generate evaluation reports in `output/`
+Either command will:
+1. Start the Green Agent (assessment manager, port 9001)
+2. Start the chosen Purple Agent (port 9002)
+3. Start the MCP server (compilation/execution tools, port 8080)
+4. Run all benchmark problems in `data/`
+5. Write `output/benchmark_summary.json`
+
+**Before running v2 with RAG enabled**, build the tutorial index once:
+
+```bash
+uv run python -m petsc_rag.build_index
+```
 
 ### Deploying Individual Components
 
 You can run the components separately (useful when deploying services on different machines or restarting a single component during development).
 
 ```bash
-# Start only the Green Agent
-uv run src/green_agent/server.py
-
-# Start only the Purple Agent
-uv run src/purple_agent/petsc_agent.py
+uv run main.py green         # Green Agent only
+uv run main.py purple        # v1 Purple Agent only
+uv run main.py purple-v2     # v2 Purple Agent only
 ```
 
-For MCP server deployment, refer to https://gitlab.com/petsc/petsc_mcp_servers
+For MCP server deployment, refer to https://gitlab.com/petsc/petsc_mcp_servers.
 
-Once the Green Agent, Purple Agent, and MCP server are running, trigger a benchmark run by sending the task message to the Green Agent:
+### Reproducing the A/B experiments
+
+Each v2 feature can be toggled off in isolation and compared against v2-with-that-feature-on. The `scripts/` directory contains one A/B harness per feature; each backs up the config, flips one knob, runs both arms, and prints a per-problem diff:
 
 ```bash
-uv run src/client_cli.py --green-url <GREEN_URL> --purple-url <PURPLE_URL> --mcp-server-url <MCP_URL>
+scripts/run_rag_ab.sh              # RAG off vs. on (holds everything else constant)
+scripts/run_diag_ab.sh             # Diagnostic-flag checks off vs. on
+scripts/run_plan_ab.sh             # Plan-then-code off vs. on
+scripts/run_multiplan_ab.sh        # num_plans=1 vs. num_plans=3 (with judge)
+scripts/run_header_ab.sh           # Header lookup off vs. on
+scripts/run_selfverify_ab.sh       # Self-verify off vs. on
 ```
+
+For noise estimation, the `*_repeat.sh` variants run each A/B N times into `<name>_results.run{1..N}/` (gitignored — regenerated locally). Aggregate with `scripts/agg_*.py`.
 
 
 ### Configuration
 
 The system uses separate configuration files for each agent:
 
-- `config/green_agent_config.yaml` - Green agent LLM model and evaluation settings
-- `config/purple_agent_config.yaml` - Purple agent LLM model settings
+- `config/green_agent_config.yaml` — Green agent LLM model and evaluation settings
+- `config/purple_agent_v2_config.yaml` — v2 Purple agent LLM + feature toggles (self-fix, RAG, plan, etc.)
 
 Example `config/green_agent_config.yaml`:
 
@@ -246,13 +292,32 @@ scoring:
     bronze: 50    # Minimum score for BRONZE tier
 ```
 
-Example `config/purple_agent_config.yaml`:
+Example `config/purple_agent_v2_config.yaml` (abbreviated — see the file for all knobs and inline docs):
 
 ```yaml
 llm:
-  model: "openai/claudeopus45"     # LLM for code generation
-  api_base_url: "https://apps-dev.inside.anl.gov/argoapi/v1"  # Optional API base URL (e.g., Argo/AskSage)
+  model: "openai/claudeopus47"
+  api_base_url: "https://apps-dev.inside.anl.gov/argoapi/v1"
   temperature: 0                    # Set to 0 only for reproducibility
+
+self_fix:
+  max_iters: 3                      # Regeneration attempts on compile/run failure
+  do_smoke_run: true
+  check_diagnostics: true           # Parse solver output for silent failures
+
+rag:
+  enabled: true                     # Requires `python -m petsc_rag.build_index` first
+  k: 4
+  rerank: true
+  k_initial: 12
+
+header_lookup:
+  enabled: true
+
+plan:
+  enabled: true
+  num_plans: 3                      # 1 = single plan; >1 enables multi-plan + judge
+  allow_plan_revision: true
 ```
 
 **Note**:

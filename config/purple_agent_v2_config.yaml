@@ -22,7 +22,7 @@ mcp:
 
 # Inner self-verification loop knobs.
 self_fix:
-  max_iters: 3        # Maximum LLM regeneration attempts after a compile/run failure
+  max_iters: 5        # Maximum LLM regeneration attempts after a compile/run failure
   do_smoke_run: true  # Also try `run_executable` after a successful compile
   smoke_run_timeout_sec: 20
   # Oracle-free correctness signal: inject PETSc's own diagnostic flags during the
